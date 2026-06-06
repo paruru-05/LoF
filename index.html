@@ -19,6 +19,7 @@
             z-index: 9999;
             cursor: default;
             user-select: none;
+            background-color: transparent;
             -webkit-tap-highlight-color: transparent;
         }
         #trigger-tr { top: 0; right: 0; }
@@ -30,10 +31,10 @@
 <body class="bg-gray-50 text-gray-800 min-h-screen flex flex-col justify-center items-center font-sans relative overflow-x-hidden">
 
     <!-- 隠しリセット用の四隅のヒットボックス (右上 -> 右下 -> 左下 -> 左上) -->
-    <div id="trigger-tr" class="corner-trigger" onclick="handleCornerClick('tr')"></div>
-    <div id="trigger-br" class="corner-trigger" onclick="handleCornerClick('br')"></div>
-    <div id="trigger-bl" class="corner-trigger" onclick="handleCornerClick('bl')"></div>
-    <div id="trigger-tl" class="corner-trigger" onclick="handleCornerClick('tl')"></div>
+    <div id="trigger-tr" class="corner-trigger"></div>
+    <div id="trigger-br" class="corner-trigger"></div>
+    <div id="trigger-bl" class="corner-trigger"></div>
+    <div id="trigger-tl" class="corner-trigger"></div>
 
     <!-- 1. お名前入力スクリーン -->
     <div id="name-screen" class="w-full max-w-md px-6 py-12 text-center transition-all duration-500 transform scale-100">
@@ -84,10 +85,10 @@
                 class="w-full px-4 py-2 text-center text-xl tracking-widest border border-gray-200 rounded-lg outline-none focus:border-gray-900 mb-4 font-mono">
             <div id="passcode-error" class="hidden text-xs text-red-500 mb-4">パスコードが違います</div>
             <div class="flex space-x-2">
-                <button onclick="closePasswordModal()" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-semibold rounded-lg transition">
+                <button id="cancel-passcode-btn" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-semibold rounded-lg transition">
                     キャンセル
                 </button>
-                <button onclick="verifyPasscode()" class="flex-1 py-2 bg-gray-900 hover:bg-gray-800 text-white text-xs font-semibold rounded-lg transition">
+                <button id="confirm-passcode-btn" class="flex-1 py-2 bg-gray-900 hover:bg-gray-800 text-white text-xs font-semibold rounded-lg transition">
                     確認
                 </button>
             </div>
@@ -127,14 +128,9 @@
         const firebaseConfig = rawFirebaseConfig ? JSON.parse(rawFirebaseConfig) : fallbackConfig;
 
         // Firebase 初期化
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-
-        // Firestoreのパブリック用コレクションパス (RULE 1)
-        const collectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'visitors');
-
+        let app, auth, db, collectionRef;
         let currentUser = null;
+        let isFirebaseOnline = false;
         let listData = [];
 
         // URLパラメータのチェック (?l か ?f か)
@@ -146,49 +142,62 @@
             currentType = 'friendship';
         }
 
-        // 1. 匿名認証の実行 (RULE 3)
-        const initAuth = async () => {
+        // Firebase接続のセットアップ
+        const initFirebase = async () => {
             try {
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                collectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'visitors');
+
                 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
                 if (initialAuthToken) {
                     await signInWithCustomToken(auth, initialAuthToken);
                 } else {
                     await signInAnonymously(auth);
                 }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        currentUser = user;
+                        isFirebaseOnline = true;
+                        startDataListener();
+                    }
+                });
             } catch (error) {
-                console.error("Auth error:", error);
-                setTimeout(initAuth, 2000);
+                console.warn("Firebase connection failed. Running in offline/local simulator mode:", error);
+                isFirebaseOnline = false;
+                // ローカルストレージから擬似的にデータを復元して準備
+                loadLocalData();
             }
         };
 
-        // 認証状態の監視
-        onAuthStateChanged(auth, (user) => {
-            if (user) {
-                currentUser = user;
-                startDataListener();
-            }
-        });
+        // ローカルデータの取得 (Firebaseが使えない場合のフォールバック)
+        function loadLocalData() {
+            const cached = localStorage.getItem('local_visitors_data');
+            listData = cached ? JSON.parse(cached) : [];
+            renderLists();
+        }
 
-        // 2. データのリアルタイム監視 (RULE 3 & RULE 2)
+        // データのリアルタイム監視 (オンライン時)
         function startDataListener() {
-            if (!currentUser) return;
-
+            if (!collectionRef) return;
             onSnapshot(collectionRef, (snapshot) => {
                 listData = [];
                 snapshot.forEach((doc) => {
                     listData.push({ id: doc.id, ...doc.data() });
                 });
                 
-                // クライアント側で時刻ソート
                 listData.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-                
                 renderLists();
             }, (error) => {
-                console.error("Firestore snapshot error:", error);
+                console.warn("Snapshot error, falling back to local data:", error);
+                isFirebaseOnline = false;
+                loadLocalData();
             });
         }
 
-        // 3. 表示データのレンダリング
+        // 表示データのレンダリング
         function renderLists() {
             const listLoveEl = document.getElementById('list-love');
             const listFriendEl = document.getElementById('list-friend');
@@ -248,21 +257,40 @@
             const name = nameInput.value.trim();
 
             if (!name) return;
-            if (!currentUser) return;
 
             if (currentType) {
-                try {
-                    await addDoc(collectionRef, {
-                        name: name,
-                        type: currentType,
-                        timestamp: Date.now()
-                    });
-                } catch (error) {
-                    console.error("Error adding document:", error);
+                if (isFirebaseOnline && currentUser) {
+                    // オンライン保存
+                    try {
+                        await addDoc(collectionRef, {
+                            name: name,
+                            type: currentType,
+                            timestamp: Date.now()
+                        });
+                    } catch (error) {
+                        console.error("Firebase write error, saving locally instead:", error);
+                        saveLocally(name, currentType);
+                    }
+                } else {
+                    // オフライン/フォールバック保存
+                    saveLocally(name, currentType);
                 }
             }
 
             transitionToMain();
+        }
+
+        // ローカル一時保存
+        function saveLocally(name, type) {
+            const newItem = {
+                id: 'local_' + Date.now(),
+                name: name,
+                type: type,
+                timestamp: Date.now()
+            };
+            listData.unshift(newItem);
+            localStorage.setItem('local_visitors_data', JSON.stringify(listData));
+            renderLists();
         }
 
         function transitionToMain() {
@@ -280,6 +308,7 @@
             }, 300);
         }
 
+        // 5. JavaScript側から全てのイベントリスナーを安全に登録
         document.getElementById('submit-name-btn').addEventListener('click', submitName);
         document.getElementById('username-input').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
@@ -287,30 +316,46 @@
             }
         });
 
-        // 5. 隠しリセットシーケンス (右上 -> 右下 -> 左下 -> 左上)
+        // 隠しリセットシーケンス (右上 -> 右下 -> 左下 -> 左上)
         const targetSequence = ['tr', 'br', 'bl', 'tl'];
         let currentSequence = [];
 
-        window.handleCornerClick = function(corner) {
+        // 四隅のDOMを取得してリスナーを登録
+        const corners = {
+            'tr': document.getElementById('trigger-tr'),
+            'br': document.getElementById('trigger-br'),
+            'bl': document.getElementById('trigger-bl'),
+            'tl': document.getElementById('trigger-tl')
+        };
+
+        Object.keys(corners).forEach(key => {
+            if (corners[key]) {
+                corners[key].addEventListener('click', () => {
+                    handleCornerClick(key);
+                });
+            }
+        });
+
+        function handleCornerClick(corner) {
             const expectedNextCorner = targetSequence[currentSequence.length];
 
             if (corner === expectedNextCorner) {
                 currentSequence.push(corner);
                 
-                // すべて完了したか確認
+                // シーケンス完了
                 if (currentSequence.length === targetSequence.length) {
-                    currentSequence = []; // シーケンスをリセット
-                    openPasswordModal(); // パスコードダイアログを表示
+                    currentSequence = []; 
+                    openPasswordModal(); 
                 }
             } else {
-                // 間違えた場合はリセット
+                // ミスしたら最初から、または最初の位置(tr)であればそこからスタート
                 if (corner === targetSequence[0]) {
                     currentSequence = [corner];
                 } else {
                     currentSequence = [];
                 }
             }
-        };
+        }
 
         // パスコードモーダルの管理
         function openPasswordModal() {
@@ -324,12 +369,19 @@
             input.focus();
         }
 
-        window.closePasswordModal = function() {
+        function closePasswordModal() {
             document.getElementById('password-modal').classList.add('hidden');
-        };
+        }
 
-        // パスコードチェック
-        window.verifyPasscode = function() {
+        document.getElementById('cancel-passcode-btn').addEventListener('click', closePasswordModal);
+        document.getElementById('confirm-passcode-btn').addEventListener('click', verifyPasscode);
+        document.getElementById('passcode-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                verifyPasscode();
+            }
+        });
+
+        function verifyPasscode() {
             const input = document.getElementById('passcode-input');
             const error = document.getElementById('passcode-error');
 
@@ -341,32 +393,30 @@
                 input.value = '';
                 input.focus();
             }
-        };
-
-        // Enterキーで認証を通せるように設定
-        document.getElementById('passcode-input').addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                verifyPasscode();
-            }
-        });
+        }
 
         // データベースの完全消去
         async function triggerDatabaseReset() {
-            if (!currentUser) return;
+            // ローカル保存データの消去
+            localStorage.removeItem('local_visitors_data');
+            listData = [];
+            renderLists();
 
-            try {
-                const querySnapshot = await getDocs(collectionRef);
-                const deletePromises = [];
-                
-                querySnapshot.forEach((docSnap) => {
-                    deletePromises.push(deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'visitors', docSnap.id)));
-                });
-
-                await Promise.all(deletePromises);
-                showResetSuccessPopup();
-            } catch (error) {
-                console.error("Reset error:", error);
+            // オンライン環境がある場合はFirestoreもリセット
+            if (isFirebaseOnline && currentUser) {
+                try {
+                    const querySnapshot = await getDocs(collectionRef);
+                    const deletePromises = [];
+                    querySnapshot.forEach((docSnap) => {
+                        deletePromises.push(deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'visitors', docSnap.id)));
+                    });
+                    await Promise.all(deletePromises);
+                } catch (error) {
+                    console.error("Firebase reset error:", error);
+                }
             }
+            
+            showResetSuccessPopup();
         }
 
         // 成功ポップアップの表示
@@ -380,7 +430,8 @@
             }, 2500);
         }
 
-        initAuth();
+        // 起動処理
+        initFirebase();
     </script>
 </body>
 </html>
